@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from '@google/genai';
@@ -6,9 +7,9 @@ import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged }
 import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 
 // Configuration for Firebase and Gemini API
-const firebaseConfig = typeof window.__firebase_config !== 'undefined' ? JSON.parse(window.__firebase_config) : {};
-const appId = typeof window.__app_id !== 'undefined' ? window.__app_id : 'default-app-id';
-const initialAuthToken = typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token : null;
+const firebaseConfig = typeof window.__firebase_config !== 'undefined' ? JSON.parse(window.__firebase_config as string) : {};
+const appId = typeof window.__app_id !== 'undefined' ? window.__app_id as string : 'default-app-id';
+const initialAuthToken = typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token as string : null;
 
 // The main App component
 const App = () => {
@@ -26,6 +27,19 @@ const App = () => {
     () => new GoogleGenAI({ apiKey: process.env.API_KEY as string }),
     []
   );
+
+  // Memoize Firebase app and services to avoid re-initializing.
+  const firebaseServices = useMemo(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const auth = getAuth(app);
+      const db = getFirestore(app);
+      return { app, auth, db };
+    } catch (error) {
+      console.error("Firebase initialization failed:", error);
+      return { app: null, auth: null, db: null };
+    }
+  }, []);
 
   // Simplified mock question bank
   const questions = [
@@ -51,56 +65,50 @@ const App = () => {
 
   // Initialize Firebase and set up authentication listener
   useEffect(() => {
-    let app, auth;
-    try {
-      app = initializeApp(firebaseConfig);
-      auth = getAuth(app);
-      
-      const unsubscribe = onAuthStateChanged(auth, async (user) => {
-        if (!user) {
-          if (initialAuthToken) {
-            await signInWithCustomToken(auth, initialAuthToken);
-          } else {
-            await signInAnonymously(auth);
-          }
-        }
-        setUserId(auth.currentUser?.uid || crypto.randomUUID());
-        setIsAuthReady(true);
-      });
-
-      return () => unsubscribe();
-    } catch (error) {
-      console.error("Firebase initialization failed:", error);
-      // Fallback for environments without Firebase
+    if (!firebaseServices.auth) {
+      // Fallback for failed initialization
       setUserId(crypto.randomUUID());
       setIsAuthReady(true);
+      return;
     }
-  }, []);
+
+    const { auth } = firebaseServices;
+    
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        if (initialAuthToken) {
+          await signInWithCustomToken(auth, initialAuthToken);
+        } else {
+          await signInAnonymously(auth);
+        }
+      }
+      setUserId(auth.currentUser?.uid || crypto.randomUUID());
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribe();
+  }, [firebaseServices]);
 
   // Fetch and listen for real-time leaderboard data
   useEffect(() => {
-    if (!isAuthReady || !userId) return;
+    if (!isAuthReady || !userId || !firebaseServices.db) return;
 
-    try {
-        const db = getFirestore(initializeApp(firebaseConfig));
-        // The query is ordered by score and limited to the top 10
-        const leaderboardQuery = query(collection(db, `artifacts/${appId}/public/data/leaderboard`), orderBy("score", "desc"), limit(10));
-        
-        const unsubscribe = onSnapshot(leaderboardQuery, (querySnapshot) => {
-          const scores: any[] = [];
-          querySnapshot.forEach((doc) => {
-            scores.push(doc.data());
-          });
-          setLeaderboardData(scores);
-        }, (error) => {
-          console.error("Error getting leaderboard data:", error);
-        });
+    const { db } = firebaseServices;
+    // The query is ordered by score and limited to the top 10
+    const leaderboardQuery = query(collection(db, `artifacts/${appId}/public/data/leaderboard`), orderBy("score", "desc"), limit(10));
+    
+    const unsubscribe = onSnapshot(leaderboardQuery, (querySnapshot) => {
+      const scores: any[] = [];
+      querySnapshot.forEach((doc) => {
+        scores.push(doc.data());
+      });
+      setLeaderboardData(scores);
+    }, (error) => {
+      console.error("Error getting leaderboard data:", error);
+    });
 
-        return () => unsubscribe();
-    } catch (error) {
-        console.error("Firestore initialization failed:", error);
-    }
-  }, [isAuthReady, userId]);
+    return () => unsubscribe();
+  }, [isAuthReady, userId, firebaseServices]);
 
   // Handler for AI doubt-solving
   const handleAiAsk = async () => {
@@ -113,7 +121,7 @@ const App = () => {
     try {
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        contents: prompt,
       });
       
       const text = response.text;
@@ -154,10 +162,10 @@ const App = () => {
 
   // Function to update the Firestore leaderboard
   const updateLeaderboard = async (score: number) => {
-    if (!isAuthReady || !userId) return;
+    if (!isAuthReady || !userId || !firebaseServices.db) return;
 
+    const { db } = firebaseServices;
     try {
-      const db = getFirestore(initializeApp(firebaseConfig));
       const leaderboardRef = collection(db, `artifacts/${appId}/public/data/leaderboard`);
 
       await addDoc(leaderboardRef, {
