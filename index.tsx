@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from '@google/genai';
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 
@@ -31,7 +31,8 @@ const App = () => {
   // Memoize Firebase app and services to avoid re-initializing.
   const firebaseServices = useMemo(() => {
     try {
-      const app = initializeApp(firebaseConfig);
+      const apps = getApps();
+      const app = apps.length > 0 ? apps[0] : initializeApp(firebaseConfig);
       const auth = getAuth(app);
       const db = getFirestore(app);
       return { app, auth, db };
