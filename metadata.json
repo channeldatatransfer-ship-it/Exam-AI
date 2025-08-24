@@ -1,5 +1,5 @@
 {
-  "name": "Exam Generator",
-  "description": "An AI-powered exam generator",
+  "name": "Chorcha Clone",
+  "description": "An educational app for practice, doubt-solving, and leaderboard tracking.",
   "requestFramePermissions": []
 }

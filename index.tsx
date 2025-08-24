@@ -1,343 +1,284 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 
+// Configuration for Firebase and Gemini API
+const firebaseConfig = typeof window.__firebase_config !== 'undefined' ? JSON.parse(window.__firebase_config) : {};
+const appId = typeof window.__app_id !== 'undefined' ? window.__app_id : 'default-app-id';
+const initialAuthToken = typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token : null;
+
+// The main App component
 const App = () => {
-  type ExamQuestion = {
-    question: string;
-    options: string[];
-    correctAnswer: string;
-    explanation: string;
-  };
-
-  type AppState = 'start' | 'loading' | 'in_progress' | 'results';
-
-  const EXAM_DURATION_SECONDS = 300; // 5 minutes
-
-  const [appState, setAppState] = useState<AppState>('start');
-  const [topic, setTopic] = useState<string>('World History');
-  const [examQuestions, setExamQuestions] = useState<ExamQuestion[]>([]);
-  const [userAnswers, setUserAnswers] = useState<string[]>([]);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState<number>(0);
-  const [timeLeft, setTimeLeft] = useState(EXAM_DURATION_SECONDS);
-  const [timeUp, setTimeUp] = useState(false);
-  const [isPopupOpen, setIsPopupOpen] = useState(false);
-  const [theme, setTheme] = useState(() => {
-    const savedTheme = localStorage.getItem('theme');
-    return savedTheme || 'light';
-  });
-
-  useEffect(() => {
-    document.body.dataset.theme = theme;
-    localStorage.setItem('theme', theme);
-  }, [theme]);
-
-  const toggleTheme = () => {
-    setTheme((prevTheme) => (prevTheme === 'light' ? 'dark' : 'light'));
-  };
+  const [currentPage, setCurrentPage] = useState('home');
+  const [questionText, setQuestionText] = useState('');
+  const [aiResponse, setAiResponse] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [userScore, setUserScore] = useState(0);
+  const [currentQuestion, setCurrentQuestion] = useState(0);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [leaderboardData, setLeaderboardData] = useState<any[]>([]);
 
   const ai = useMemo(
     () => new GoogleGenAI({ apiKey: process.env.API_KEY as string }),
     []
   );
 
-  const handleSubmit = useCallback(() => {
-    if (timeLeft <= 0) {
-      setTimeUp(true);
-    }
-    setAppState('results');
-  }, [timeLeft]);
+  // Simplified mock question bank
+  const questions = [
+    {
+      id: 1,
+      text: "What is the capital of France?",
+      options: ["Berlin", "Madrid", "Paris", "Rome"],
+      answer: "Paris",
+    },
+    {
+      id: 2,
+      text: "Which planet is known as the Red Planet?",
+      options: ["Venus", "Mars", "Jupiter", "Saturn"],
+      answer: "Mars",
+    },
+    {
+      id: 3,
+      text: "What is the powerhouse of the cell?",
+      options: ["Nucleus", "Ribosome", "Mitochondria", "Cytoplasm"],
+      answer: "Mitochondria",
+    },
+  ];
 
-
+  // Initialize Firebase and set up authentication listener
   useEffect(() => {
-    if (appState !== 'in_progress') {
-      return;
+    let app, auth;
+    try {
+      app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      
+      const unsubscribe = onAuthStateChanged(auth, async (user) => {
+        if (!user) {
+          if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            await signInAnonymously(auth);
+          }
+        }
+        setUserId(auth.currentUser?.uid || crypto.randomUUID());
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("Firebase initialization failed:", error);
+      // Fallback for environments without Firebase
+      setUserId(crypto.randomUUID());
+      setIsAuthReady(true);
     }
+  }, []);
 
-    if (timeLeft === 0) {
-      handleSubmit();
-      return;
+  // Fetch and listen for real-time leaderboard data
+  useEffect(() => {
+    if (!isAuthReady || !userId) return;
+
+    try {
+        const db = getFirestore(initializeApp(firebaseConfig));
+        // The query is ordered by score and limited to the top 10
+        const leaderboardQuery = query(collection(db, `artifacts/${appId}/public/data/leaderboard`), orderBy("score", "desc"), limit(10));
+        
+        const unsubscribe = onSnapshot(leaderboardQuery, (querySnapshot) => {
+          const scores: any[] = [];
+          querySnapshot.forEach((doc) => {
+            scores.push(doc.data());
+          });
+          setLeaderboardData(scores);
+        }, (error) => {
+          console.error("Error getting leaderboard data:", error);
+        });
+
+        return () => unsubscribe();
+    } catch (error) {
+        console.error("Firestore initialization failed:", error);
     }
+  }, [isAuthReady, userId]);
 
-    const timerId = setInterval(() => {
-      setTimeLeft((prevTime) => prevTime - 1);
-    }, 1000);
+  // Handler for AI doubt-solving
+  const handleAiAsk = async () => {
+    if (!questionText.trim()) return;
+    setIsLoading(true);
+    setAiResponse('');
 
-    return () => clearInterval(timerId);
-  }, [appState, timeLeft, handleSubmit]);
-
-
-  const generateExam = async (examTopic = topic) => {
-    setAppState('loading');
-    setTopic(examTopic);
+    const prompt = `Act as a subject matter expert and provide a helpful, educational response to the following question, do not respond with just the answer, but rather a brief explanation: "${questionText}"`;
+  
     try {
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: `Generate a 10-question multiple-choice exam on the topic of ${examTopic}.`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              questions: {
-                type: Type.ARRAY,
-                description: 'An array of 10 multiple-choice questions.',
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: {
-                      type: Type.STRING,
-                      description: 'The question text.',
-                    },
-                    options: {
-                      type: Type.ARRAY,
-                      description:
-                        'An array of 4 possible answers (strings).',
-                      items: { type: Type.STRING },
-                    },
-                    correctAnswer: {
-                      type: Type.STRING,
-                      description: 'The correct answer from the options.',
-                    },
-                    explanation: {
-                      type: Type.STRING,
-                      description:
-                        'A brief explanation of why the answer is correct.',
-                    },
-                  },
-                  required: [
-                    'question',
-                    'options',
-                    'correctAnswer',
-                    'explanation',
-                  ],
-                },
-              },
-            },
-            required: ['questions'],
-          },
-        },
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
       });
-
-      const examData = JSON.parse(response.text);
-      if (examData.questions && examData.questions.length > 0) {
-        setExamQuestions(examData.questions);
-        setUserAnswers(new Array(examData.questions.length).fill(null));
-        setCurrentQuestionIndex(0);
-        setTimeLeft(EXAM_DURATION_SECONDS);
-        setTimeUp(false);
-        setAppState('in_progress');
+      
+      const text = response.text;
+      if (text) {
+        setAiResponse(text);
       } else {
-        throw new Error('Failed to generate exam questions.');
+        setAiResponse("Sorry, I couldn't generate a response. Please try again.");
       }
     } catch (error) {
-      console.error('Error generating exam:', error);
-      alert(
-        'Sorry, there was an error generating the exam. Please try again.'
-      );
-      setAppState('start');
+      console.error("API call failed:", error);
+      setAiResponse("An error occurred. Please check your network connection and try again.");
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const handleCurriculumSelect = (selectedTopic: string) => {
-    setIsPopupOpen(false);
-    generateExam(selectedTopic);
-  };
-
-  const handleAnswerSelect = (answer: string) => {
-    const newAnswers = [...userAnswers];
-    newAnswers[currentQuestionIndex] = answer;
-    setUserAnswers(newAnswers);
-  };
-
-  const handleNext = () => {
-    if (currentQuestionIndex < examQuestions.length - 1) {
-      setCurrentQuestionIndex(currentQuestionIndex + 1);
+  // Handler for practicing questions
+  const handleAnswerClick = (selectedAnswer: string) => {
+    const isCorrect = selectedAnswer === questions[currentQuestion].answer;
+    if (isCorrect) {
+      setUserScore(userScore + 1);
+      alert('Correct!');
+    } else {
+      alert('Incorrect!');
+    }
+    
+    if (currentQuestion < questions.length - 1) {
+      setCurrentQuestion(currentQuestion + 1);
+    } else {
+      const finalScore = userScore + (isCorrect ? 1 : 0);
+      alert(`Quiz finished! Your score is ${finalScore} / ${questions.length}.`);
+      updateLeaderboard(finalScore);
+      setCurrentPage('home');
+      setUserScore(0);
+      setCurrentQuestion(0);
     }
   };
 
-  const handlePrevious = () => {
-    if (currentQuestionIndex > 0) {
-      setCurrentQuestionIndex(currentQuestionIndex - 1);
+  // Function to update the Firestore leaderboard
+  const updateLeaderboard = async (score: number) => {
+    if (!isAuthReady || !userId) return;
+
+    try {
+      const db = getFirestore(initializeApp(firebaseConfig));
+      const leaderboardRef = collection(db, `artifacts/${appId}/public/data/leaderboard`);
+
+      await addDoc(leaderboardRef, {
+        userId: userId,
+        score: score,
+        timestamp: new Date().toISOString(),
+      });
+      console.log("Score added to leaderboard.");
+    } catch (error) {
+      console.error("Error updating leaderboard:", error);
     }
-  };
-  
-  const handleReset = () => {
-    setAppState('start');
-    setExamQuestions([]);
-    setUserAnswers([]);
-    setCurrentQuestionIndex(0);
-    setTopic('World History');
-    setTimeUp(false);
-  };
-
-  const calculateScore = () => {
-    return userAnswers.reduce((score, answer, index) => {
-      if (answer === examQuestions[index].correctAnswer) {
-        return score + 1;
-      }
-      return score;
-    }, 0);
-  };
-
-  const formatTime = (seconds: number) => {
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
   };
 
   const renderContent = () => {
-    switch (appState) {
-      case 'loading':
+    switch (currentPage) {
+      case 'home':
         return (
-          <div className="card loading-card">
-            <div className="spinner"></div>
-            <h2>Generating your exam on {topic}...</h2>
-            <p>Please wait a moment.</p>
+          <div className="flex flex-col items-center justify-center p-6 space-y-4">
+            <h2 className="text-2xl font-bold">Welcome to Chorcha-like App</h2>
+            <p className="text-gray-700">Choose an activity to start your preparation.</p>
+            <div className="flex space-x-4">
+              <button
+                onClick={() => setCurrentPage('practice')}
+                className="px-6 py-3 bg-blue-500 text-white font-semibold rounded-full shadow-lg hover:bg-blue-600 transition duration-300 ease-in-out transform hover:scale-105"
+              >
+                Start Practice
+              </button>
+              <button
+                onClick={() => setCurrentPage('ai-help')}
+                className="px-6 py-3 bg-green-500 text-white font-semibold rounded-full shadow-lg hover:bg-green-600 transition duration-300 ease-in-out transform hover:scale-105"
+              >
+                AI Doubt-Solver
+              </button>
+            </div>
+            <div className="w-full max-w-lg mt-8 bg-gray-100 p-4 rounded-lg shadow-inner">
+              <h3 className="text-xl font-bold text-center mb-4">Top 10 Scores</h3>
+              {leaderboardData.length > 0 ? (
+                <ul className="divide-y divide-gray-300">
+                  {leaderboardData.map((item, index) => (
+                    <li key={index} className="flex justify-between items-center py-2 px-3">
+                      <span className="font-medium">{item.userId.substring(0, 8)}...</span>
+                      <span className="font-bold text-lg text-blue-600">{item.score}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-center text-gray-500">No scores yet. Be the first to play!</p>
+              )}
+            </div>
           </div>
         );
-      case 'in_progress':
-        const currentQuestion = examQuestions[currentQuestionIndex];
+      case 'practice':
+        const question = questions[currentQuestion];
         return (
-          <div className="card exam-card">
-            <div className="exam-header">
-              <h2>{topic} Exam</h2>
-              <div className="exam-meta">
-                <p className={`timer ${timeLeft <= 30 ? 'low-time' : ''}`}>
-                  {formatTime(timeLeft)}
-                </p>
-                <p className="progress">
-                  Question {currentQuestionIndex + 1} of {examQuestions.length}
-                </p>
-              </div>
-            </div>
-            <div className="question-container">
-              <h3>{currentQuestion.question}</h3>
-              <div className="options-container">
-                {currentQuestion.options.map((option, index) => (
+          <div className="flex flex-col items-center justify-center p-6 space-y-6">
+            <h2 className="text-2xl font-bold">Quick Practice</h2>
+            <div className="w-full max-w-lg p-6 bg-white rounded-lg shadow-md">
+              <p className="text-lg font-semibold mb-4">{question.text}</p>
+              <div className="flex flex-col space-y-3">
+                {question.options.map((option, index) => (
                   <button
                     key={index}
-                    className={`option-btn ${
-                      userAnswers[currentQuestionIndex] === option
-                        ? 'selected'
-                        : ''
-                    }`}
-                    onClick={() => handleAnswerSelect(option)}
-                    aria-pressed={userAnswers[currentQuestionIndex] === option}
+                    onClick={() => handleAnswerClick(option)}
+                    className="px-4 py-2 text-left bg-gray-100 rounded-lg shadow-sm hover:bg-gray-200 transition duration-200"
                   >
                     {option}
                   </button>
                 ))}
               </div>
             </div>
-            <div className="navigation-buttons">
-              <button onClick={handlePrevious} disabled={currentQuestionIndex === 0}>
-                Previous
-              </button>
-              {currentQuestionIndex < examQuestions.length - 1 ? (
-                <button onClick={handleNext}>Next</button>
-              ) : (
-                <button onClick={handleSubmit} className="primary">Submit</button>
-              )}
-            </div>
+            <p className="text-lg font-bold">Score: {userScore}</p>
+            <button
+              onClick={() => setCurrentPage('home')}
+              className="mt-4 px-4 py-2 bg-red-500 text-white rounded-full shadow hover:bg-red-600 transition duration-300"
+            >
+              Back to Home
+            </button>
           </div>
         );
-        case 'results':
-          const score = calculateScore();
-          return (
-            <div className="card results-card">
-              <h2>Exam Results</h2>
-              {timeUp && <p className="time-up-message">Time's up!</p>}
-              <p className="score">
-                You scored {score} out of {examQuestions.length}!
-              </p>
-              <div className="review-section">
-                {examQuestions.map((question, index) => (
-                  <div key={index} className="review-question">
-                    <h4>{index + 1}. {question.question}</h4>
-                    <p className={`result ${userAnswers[index] === question.correctAnswer ? 'correct' : 'incorrect'}`}>
-                      Your answer: {userAnswers[index] || 'Not answered'}
-                    </p>
-                    {userAnswers[index] !== question.correctAnswer && (
-                      <p className="correct-answer">Correct answer: {question.correctAnswer}</p>
-                    )}
-                    <p className="explanation"><strong>Explanation:</strong> {question.explanation}</p>
-                  </div>
-                ))}
-              </div>
-              <button onClick={handleReset} className="primary">Take Another Exam</button>
-            </div>
-          );
-      case 'start':
-      default:
+      case 'ai-help':
         return (
-          <div className="card start-card">
-            <h1>AI Exam Generator</h1>
-            <p>Select a topic, or choose from the Bangladesh curriculum to generate a custom exam instantly.</p>
-            <div className="topic-selector">
-              <label htmlFor="topic-select">Choose a topic:</label>
-              <select id="topic-select" value={topic} onChange={(e) => setTopic(e.target.value)}>
-                <option value="World History">World History</option>
-                <option value="Astrophysics">Astrophysics</option>
-                <option value="Marine Biology">Marine Biology</option>
-                <option value="Classical Music">Classical Music</option>
-                <option value="JavaScript Fundamentals">JavaScript Fundamentals</option>
-              </select>
+          <div className="flex flex-col items-center justify-center p-6 space-y-6">
+            <h2 className="text-2xl font-bold">AI Doubt-Solver</h2>
+            <textarea
+              className="w-full max-w-xl p-4 border border-gray-300 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+              rows={6}
+              placeholder="Ask me a question about any subject..."
+              value={questionText}
+              onChange={(e) => setQuestionText(e.target.value)}
+            ></textarea>
+            <button
+              onClick={handleAiAsk}
+              disabled={isLoading}
+              className="px-6 py-3 bg-blue-500 text-white font-semibold rounded-full shadow-lg hover:bg-blue-600 transition duration-300 ease-in-out transform hover:scale-105 disabled:bg-gray-400"
+            >
+              {isLoading ? 'Thinking...' : 'Ask AI'}
+            </button>
+            <div className="w-full max-w-xl p-6 bg-white rounded-lg shadow-md min-h-[150px]">
+              <p className="font-semibold text-gray-800">AI Response:</p>
+              <p className="mt-2 text-gray-600 whitespace-pre-wrap">{aiResponse}</p>
             </div>
-            <div className="start-actions">
-              <button className="primary" onClick={() => generateExam()}>Generate Exam</button>
-              <button onClick={() => setIsPopupOpen(true)}>View Bangladesh Curriculum</button>
-            </div>
+            <button
+              onClick={() => setCurrentPage('home')}
+              className="mt-4 px-4 py-2 bg-red-500 text-white rounded-full shadow hover:bg-red-600 transition duration-300"
+            >
+              Back to Home
+            </button>
           </div>
         );
+      default:
+        return null;
     }
   };
 
-  const renderPopup = () => {
-    if (!isPopupOpen) return null;
-
-    return (
-      <div className="popup-overlay" onClick={() => setIsPopupOpen(false)}>
-        <div className="popup-content" onClick={(e) => e.stopPropagation()}>
-          <button className="popup-close-btn" onClick={() => setIsPopupOpen(false)} aria-label="Close popup">&times;</button>
-          <h2>Bangladesh Education Curriculum</h2>
-          <div className="popup-body">
-            <button onClick={() => handleCurriculumSelect('Bangladesh Primary Level (Classes 1-5)')}>
-              Primary Level (Classes 1-5)
-            </button>
-            <button onClick={() => handleCurriculumSelect('Bangladesh Junior Secondary Level (Classes 6-8)')}>
-              Junior Secondary Level (Classes 6-8)
-            </button>
-            <button onClick={() => handleCurriculumSelect('Bangladesh Secondary Level (Classes 9-10)')}>
-              Secondary Level (Classes 9-10)
-            </button>
-            <button onClick={() => handleCurriculumSelect('Bangladesh Higher Secondary (Science)')}>
-              Higher Secondary (Science)
-            </button>
-            <button onClick={() => handleCurriculumSelect('Bangladesh Higher Secondary (Arts/Humanities)')}>
-              Higher Secondary (Arts/Humanities)
-            </button>
-            <button onClick={() => handleCurriculumSelect('Bangladesh Higher Secondary (Commerce/Business)')}>
-              Higher Secondary (Commerce/Business)
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
   return (
-    <>
-      <button
-        onClick={toggleTheme}
-        className="theme-toggle"
-        aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-      >
-        {theme === 'light' ? '🌙' : '☀️'}
-      </button>
-      <main>{renderContent()}</main>
-      {renderPopup()}
-    </>
+    <div className="min-h-screen bg-gray-50 font-sans text-gray-900 flex flex-col items-center justify-center p-4">
+      <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-3xl border border-gray-200">
+        <h1 className="text-4xl font-extrabold text-center mb-6 text-blue-700">Chorcha Clone</h1>
+        {isAuthReady ? renderContent() : <p>Initializing...</p>}
+      </div>
+    </div>
   );
 };
 
